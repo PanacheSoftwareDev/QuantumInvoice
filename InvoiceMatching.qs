@@ -8,45 +8,50 @@ namespace InvoiceMatchingDemo {
         return r == One ? 1 | 0;
     }
 
-    // Convert integer index (0–15) to 4-bit array
-    function IntToBits4(n : Int) : Int[] {
-        return [
-            (n >>> 3) &&& 1,
-            (n >>> 2) &&& 1,
-            (n >>> 1) &&& 1,
-            n &&& 1
-        ];
+    // Map field value 1..4 to two bits [msb, lsb]
+    function EncodeTwoBits(v : Int) : Int[] {
+        // mapping: 1 -> 00, 2 -> 01, 3 -> 10, 4 -> 11
+        if (v == 1) { return [0, 0]; }
+        elif (v == 2) { return [0, 1]; }
+        elif (v == 3) { return [1, 0]; }
+        else { return [1, 1]; }
     }
 
-    // Oracle: marks exactly one basis state
-    operation Oracle(allQubits : Qubit[], targetIndex : Int) : Unit is Adj + Ctl {
-        let bits = IntToBits4(targetIndex);
+    // Build 4-bit encoding [amt_msb, amt_lsb, date_msb, date_lsb]
+    function EncodeInvoice(amt : Int, date : Int) : Int[] {
+        let a = EncodeTwoBits(amt);
+        let d = EncodeTwoBits(date);
+        return [a[0], a[1], d[0], d[1]];
+    }
 
-        // Flip qubits where target bit = 0
+    // Oracle: marks all basis states that match targetBits (length 4)
+    operation OracleMatchPattern(allQubits : Qubit[], targetBits : Int[]) : Unit is Adj + Ctl {
+        // We assume allQubits length == 4 and targetBits length == 4
+        // Flip qubits where target bit == 0 so that matching states become |1111>
         for i in 0..3 {
-            if (bits[i] == 0) {
+            if (targetBits[i] == 0) {
                 X(allQubits[i]);
             }
         }
 
-        // Multi-controlled Z
+        // Multi-controlled Z with first 3 as controls and last as target
         Controlled Z(allQubits[0..2], allQubits[3]);
 
         // Undo flips
         for i in 0..3 {
-            if (bits[i] == 0) {
+            if (targetBits[i] == 0) {
                 X(allQubits[i]);
             }
         }
     }
 
-    // Perfect diffusion operator
+    // Diffusion on 4 qubits
     operation Diffusion(allQubits : Qubit[]) : Unit {
         ApplyToEach(H, allQubits);
         ApplyToEach(X, allQubits);
 
         Controlled Z(allQubits[0..2], allQubits[3]);
- 
+
         ApplyToEach(X, allQubits);
         ApplyToEach(H, allQubits);
     }
@@ -75,7 +80,6 @@ namespace InvoiceMatchingDemo {
 
     @EntryPoint()
     operation RunGroverInvoiceMatch() : String {
-
         // Classical invoice dataset
         let invoices = [
             ("INV-2026-001", 2, 3),
@@ -96,17 +100,20 @@ namespace InvoiceMatchingDemo {
             ("INV-2026-016", 4, 4)
         ];
 
-        // Choose target by classical matching
+        // Precompute invoice encodings and count matches M
+        mutable encodings = [];
+        for i in 0..Length(invoices)-1 {
+            let (_, amt, dt) = invoices[i];
+            set encodings += [EncodeInvoice(amt, dt)];
+        }
+
+        // Choose target by classical values
         let targetAmount = 2;
         let targetDate   = 1;
 
-        mutable targetIndex = 0;
-        for i in 0..Length(invoices)-1 {
-            let (_, amt, dt) = invoices[i];
-            if (amt == targetAmount and dt == targetDate) {
-                set targetIndex = i;
-            }
-        }
+        // Build target 4-bit pattern
+        let targetPattern = EncodeInvoice(targetAmount, targetDate);
+        // Example: amount=2 -> [0,1], date=1 -> [0,0] => [0,1,0,0] (0100)
 
         use qubits = Qubit[4];
 
@@ -118,7 +125,7 @@ namespace InvoiceMatchingDemo {
 
         // Grover iterations
         for _ in 1..iterations {
-            Oracle(qubits, targetIndex);
+            OracleMatchPattern(qubits, targetPattern);
             Diffusion(qubits);
         }
 
@@ -126,15 +133,28 @@ namespace InvoiceMatchingDemo {
         let results = MeasureEachZ(qubits);
         ResetAll(qubits);
 
-        // Convert measurement to integer index
-        let idx =
-            Bit(results[0]) * 8 +
-            Bit(results[1]) * 4 +
-            Bit(results[2]) * 2 +
-            Bit(results[3]) * 1;
+        // Convert measurement to 4-bit array (MSB first)
+        let measuredBits = [
+            Bit(results[0]),
+            Bit(results[1]),
+            Bit(results[2]),
+            Bit(results[3])
+        ];
 
-        let (id, _, _) = invoices[idx];
+        // Find first invoice whose encoding equals measuredBits
+        mutable foundIdx = -1;
+        for i in 0..Length(invoices)-1 {
+            if (encodings[i] == measuredBits) {
+                set foundIdx = i;
+            }
+        }
 
+        if (foundIdx == -1) {
+            Message("Measured pattern did not match any invoice (probabilistic outcome).");
+            return "No match after measurement";
+        }
+
+        let (id, _, _) = invoices[foundIdx];
         Message($"Matched invoice: {id}");
         return id;
     }
